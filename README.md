@@ -1,6 +1,6 @@
 # LangGraph — Complete Notes
 
-A single reference merged from the topic notes. Flow: **what it is → the state schema → reducers → notebook walkthroughs → memory & tool calls**.
+A single reference merged from the topic notes. Flow: **what it is → the state schema → reducers → notebook walkthroughs → memory & tool calls → routers, tools & agents**.
 
 ## Contents
 
@@ -9,6 +9,11 @@ A single reference merged from the topic notes. Flow: **what it is → the state
 3. [Reducers — How State Updates Merge](#3-reducers--how-state-updates-merge)
 4. [LangGraph Basics — Notebook Walkthroughs](#4-langgraph-basics--notebook-walkthroughs)
 5. [Memory Across Conversations & How Tool Calls Really Work](#5-memory-across-conversations--how-tool-calls-really-work)
+6. [Router — the LLM as a Router (a Basic Agent)](#6-router--the-llm-as-a-router-a-basic-agent)
+7. [Tools — the Bridge to External Systems](#7-tools--the-bridge-to-external-systems)
+8. [Chatbot with Multiple Tools](#8-chatbot-with-multiple-tools)
+9. [Agents — the ReAct Architecture](#9-agents--the-react-architecture)
+10. [Practical Gotchas — Fixes from Building the Multi-Tool Chatbot](#10-practical-gotchas--fixes-from-building-the-multi-tool-chatbot)
 
 ---
 
@@ -431,3 +436,277 @@ You *can* wire it this way, but **bulk ingestion of chunks into a vector DB is u
 ## One sentence
 
 Message history only persists across separate conversations if you add a **checkpointer + thread_id**; and an LLM never touches a vector DB directly — it **emits a tool call** and your **graph node executes the tool** that does the reading or writing.
+
+---
+
+# 6. Router — the LLM as a Router (a Basic Agent)
+
+## Recap: what we already have
+
+A graph that (1) uses **messages as state** and (2) a **chat model with bound tools** (`bind_tools([add])`). When that model runs, it returns **one of two things**:
+
+1. **A tool call** — "please run `add(a, b)`"
+2. **A natural-language response** — a direct answer, no tool
+
+## The key idea: the LLM *is* the router
+
+Compare the two graph shapes:
+
+```
+Workflow (rigid):          Router / Agent (branches):
+  start                       start
+    │                           │
+    ▼                           ▼
+ llm_tool                    llm_tool ──┐  (routes)
+    │                         │         │
+    ▼                         ▼         ▼
+   end                      tools      end   (direct response)
+                              │
+                              ▼
+                             end
+```
+
+> *"We can think of this as a **router**, where the chat model routes between a direct response or a tool call based upon the user input."*
+
+The branching decision is made by **`tools_condition`**: it inspects the LLM's last message — if it contains a tool call → route to the **`tools`** node; if not → route to **`END`**.
+
+## Why this is a "Basic Agent"
+
+> *"This is a simple example of an **agent**, where the LLM is directing the control flow either by calling a tool or just responding directly."*
+
+```
+                    (tools bound = its "menu")
+START ──▶ LLM (the BRAIN) ──┬──▶ node ──▶ End     (Step 2: respond directly)
+                            └──▶ node ──▶ End     (Step 3: call a tool)
+```
+
+An **agent = an LLM that decides what the program does next.** The router is the smallest possible version of that: one decision, two outcomes.
+
+## One sentence
+
+A **router** is a graph where the LLM itself chooses the next step — call a tool or answer directly — via `tools_condition`; that single act of the model *directing control flow* is what makes it the simplest kind of agent.
+
+---
+
+# 7. Tools — the Bridge to External Systems
+
+## The problem tools solve
+
+An LLM is just a **brain** — text in, text out. Ask *"what's the current temperature in New York?"* and the raw model can't answer; that data isn't in its weights. It needs to reach the outside world.
+
+```
+ I/P ──▶ ┌─────────┐ ──▶ O/P ("current temp of New York")  ──▶ Human
+         │   LLM   │
+         │ (Brain) │ ◀──▶  Tool Call  ──▶  3rd-party API
+         └─────────┘        Schema {JSON}    Weather API
+              ▲                               Database / external source
+           Binding
+```
+
+A **tool** is that bridge — a documented function the LLM can invoke to reach 3rd-party APIs, a weather API, a database, or any external source.
+
+## How the LLM uses a tool
+
+- **Schema `{JSON}`** — every tool exposes a JSON schema (name, purpose, argument types). That's how the model knows *what the tool does* and *what inputs to pass*.
+- **Binding** — `llm.bind_tools([...])` hands the model the **menu** of available tools. Binding does **not** let the model *run* them; it lets the model *request* them. Your graph node runs the actual function.
+
+## Example — the `add` tool
+
+```
+ I/P "What is 2 plus 2?"  (natural language)
+        │
+        ▼
+      START ──▶ Chatbot (LLM) ──▶ LLM → BRAIN → Tool_call
+                   │  ┌──────────────┐
+                   ├─▶│ Tool: add()  │──▶ END
+                   │  │ """docstring"""
+                   └─▶ END            │  return a + b
+                                      └──────────────┘
+```
+
+- The model reads the natural-language input and decides to call `add()`.
+- **The docstring is mandatory** — LangChain uses it as the tool's description in the JSON schema. A tool function with no docstring (and no explicit `description`) raises `ValueError: Function must have a docstring if description not provided.` Decorate with `@tool` and give it a one-line docstring.
+
+## One sentence
+
+A **tool** is a schema-described, docstring-documented function you **bind** to the LLM so it can *request* external actions; the model chooses the tool and its arguments, and your **graph node executes it**.
+
+---
+
+# 8. Chatbot with Multiple Tools
+
+## Same router, bigger toolbox
+
+The graph shape is **identical** to the single-tool router — only the `tools` node now wraps a whole **collection**, and `tool_calling_llm` has all of them bound:
+
+```
+__start__ ──▶ tool_calling_llm ──▶ tools ──▶ __end__
+                     │                          ▲
+                     └──────────────────────────┘  (conditional: no tool → straight to end)
+```
+
+## The toolbox
+
+| Tool | What it fetches | Kind |
+|------|-----------------|------|
+| **Arxiv** | research papers | prebuilt integration |
+| **Wikipedia** | encyclopedia content | prebuilt integration |
+| **Internet Search (Tavily)** | live web results (needs a **Tavily API key**) | prebuilt integration |
+| **add()** | custom arithmetic | your own function |
+| **multiply()** | custom arithmetic | your own function |
+
+## The insight: you don't route per tool
+
+You **bind all of them** and let the **LLM pick the right one(s)** per query:
+
+- *"recent papers on RAG?"* → Arxiv
+- *"who invented Python?"* → Wikipedia
+- *"news today?"* → Tavily
+- *"12 × 7?"* → multiply
+
+`tools_condition` still answers just **one** yes/no question — *did the model request any tool?* — and `ToolNode` dispatches to whichever specific tool the model named. Mixing **prebuilt integrations** (Arxiv, Wikipedia, Tavily) with **your own functions** (add, multiply) in a single `tools=[...]` list is the whole point.
+
+## One sentence
+
+Scaling from one tool to many changes **nothing** about the graph — you bind a mixed list of prebuilt and custom tools, and the LLM + `tools_condition` + `ToolNode` handle selection and dispatch automatically.
+
+---
+
+# 9. Agents — the ReAct Architecture
+
+## Recap: the four building blocks
+
+Everything so far has been climbing one ladder:
+
+```
+Chains  →  Routers  →  Tools  →  Basic Agent
+```
+
+Supporting pieces: **`ToolNode`** + **`tools_condition`** (the conditional-edge router), and **LangSmith** for **tracking & monitoring** a running agent.
+
+## Basic Agent = the router you already have
+
+```
+Natural-language i/p
+        │
+        ▼
+      START ──▶ LLM (BRAIN) ──┬──▶ END        (direct answer)
+                              └──▶ Tools ──▶ End
+```
+
+This is the multi-tool chatbot. The LLM decides: answer directly, or call a tool. But notice — the `Tools` node goes **straight to End**. It calls a tool *once*.
+
+## The new idea: ReAct — a *general* agent architecture
+
+A real agent loops through three steps until the task is done:
+
+1. **Act** — the model calls a specific tool.
+2. **Observe** — the tool's output is fed **back** to the model.
+3. **Reason** — using that output + the original input, the model decides the **next step**: call another tool, or finish.
+
+## Why the loop matters
+
+Prompt: **"Please add 5 plus 5 and then multiply by 3."**
+
+- A **basic router** calls one tool and stops — it *can't* complete this two-step task.
+- A **ReAct agent** loops:
+
+```
+Act      → add(5, 5)
+Observe  → 10
+Reason   → "now multiply that by 3"
+Act      → multiply(10, 3)
+Observe  → 30
+Reason   → "done"  → END
+```
+
+## The one structural change
+
+```
+Router (calls a tool once):        ReAct agent (loops):
+  llm ──▶ tools ──▶ END               llm ──▶ tools
+                                       ▲         │
+                                       └─────────┘   (tools loops BACK to llm)
+```
+
+Turning a router into a ReAct agent is a **single edge change**: make the `tools` node route **back to the LLM** (`tools → llm`) instead of to `END`. That back-edge is what lets the model observe each tool result and chain multiple tool calls. Everything else — state, `add_messages`, `tools_condition`, `ToolNode` — stays exactly the same.
+
+## One sentence
+
+**ReAct = Act → Observe → Reason, on a loop**; the only graph change from the basic router is that the `tools` node feeds its output *back to the LLM* instead of ending, which is what enables multi-step tool use.
+
+---
+
+# 10. Practical Gotchas — Fixes from Building the Multi-Tool Chatbot
+
+Real errors hit while building the notebooks, and what actually fixed them. These are environment/version issues, not concept issues — but they'll stop you cold.
+
+## A tool function needs a docstring
+
+`ToolNode([add])` (or `@tool`) auto-converts a function into a tool and uses its **docstring as the description**. A function with no docstring raises:
+
+```
+ValueError: Function must have a docstring if description not provided.
+```
+
+**Fix:** decorate with `@tool` and give it a one-line docstring.
+```python
+from langchain_core.tools import tool
+
+@tool
+def add(a: int, b: int) -> int:
+    """Add two numbers and return the result."""
+    return a + b
+```
+
+## Name your nodes and edges consistently
+
+`builder.add_node("llm_tools", ...)` but then `builder.add_edge(START, "llm_tool")` (missing `s`) fails at `compile()` with an "unknown node" error. The node name in `add_node` must match every `add_edge` / `add_conditional_edges` reference **exactly**. (`tools_condition` routes to a node literally named `"tools"` by default.)
+
+## Display/invoke the graph variable you actually compiled
+
+If your tool graph compiles into `graph_builder` but your display cell draws `graph` (an earlier, simpler compile), you'll render the **wrong** graph and never see your `tools` node. Keep one consistent variable name — compile the final graph into `graph` and both `display(...)` and `graph.invoke(...)` use it.
+
+## arxiv — the version trap
+
+`langchain_community`'s `ArxivQueryRun` calls `arxiv.Search(...).results()`, which **modern `arxiv` (>=2) removed** → `AttributeError: 'Search' object has no attribute 'results'`. But pinning `arxiv<2` hits the opposite wall: 1.4.x uses `http://` and Arxiv now 301-redirects to https → `HTTPError: HTTP 301`. No single version satisfies the old wrapper.
+
+**Fix:** skip the broken wrapper — wrap the **modern arxiv client** as your own `@tool`.
+```python
+import arxiv as arxiv_lib          # uv add "arxiv>=2"
+from langchain_core.tools import tool
+
+_client = arxiv_lib.Client()       # modern client uses https
+
+@tool
+def arxiv(query: str) -> str:
+    """Search arxiv.org for papers and return titles, authors, dates and summaries."""
+    papers = _client.results(arxiv_lib.Search(query=query, max_results=2))
+    return "\n\n".join(
+        f"Title: {p.title}\nAuthors: {', '.join(a.name for a in p.authors)}\nSummary: {p.summary[:500]}"
+        for p in papers
+    ) or "No results found."
+```
+
+## wikipedia — HTTP 429 → JSONDecodeError
+
+The old `wikipedia` package sends a **generic User-Agent**, which Wikimedia now rate-limits (HTTP 429). The 429 body is plain text, and the library blindly calls `.json()` on it →
+
+```
+JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+```
+
+**Fix:** set a **descriptive User-Agent** (and the https endpoint) *before* creating the wrapper.
+```python
+import wikipedia
+wikipedia.wikipedia.USER_AGENT = "MyApp/1.0 (https://github.com/you/your-repo)"
+wikipedia.wikipedia.API_URL = "https://en.wikipedia.org/w/api.php"
+```
+
+## Restart the kernel after changing packages or tool objects
+
+Jupyter caches imported modules and variables. After a `uv add`/downgrade, or after editing a cell that (re)defines a tool, **re-running one cell isn't enough** — the kernel still holds the old module/object in `sys.modules` and the namespace. Use **Restart → Run All** so the change actually takes effect. (This is why a fix that's correct on disk can still show the identical old error.)
+
+## One sentence
+
+Most "it doesn't work" moments here are **version/environment traps** — docstring-less tools, node-name typos, stale kernels, and langchain-community's aging arxiv/wikipedia wrappers — fixed by adding docstrings, keeping names consistent, wrapping modern clients yourself, setting a real User-Agent, and restarting the kernel.
