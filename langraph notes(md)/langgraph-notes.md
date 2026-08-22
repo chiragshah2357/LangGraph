@@ -1,0 +1,433 @@
+# LangGraph — Complete Notes
+
+A single reference merged from the topic notes. Flow: **what it is → the state schema → reducers → notebook walkthroughs → memory & tool calls**.
+
+## Contents
+
+1. [Getting Started with LangGraph](#1-getting-started-with-langgraph)
+2. [What Actually Is the State Schema?](#2-what-actually-is-the-state-schema)
+3. [Reducers — How State Updates Merge](#3-reducers--how-state-updates-merge)
+4. [LangGraph Basics — Notebook Walkthroughs](#4-langgraph-basics--notebook-walkthroughs)
+5. [Memory Across Conversations & How Tool Calls Really Work](#5-memory-across-conversations--how-tool-calls-really-work)
+
+---
+
+# 1. Getting Started with LangGraph
+
+## What is LangGraph?
+
+**LangGraph** is a library for building **stateful, multi-actor applications with LLMs** — used to create **agent and multi-agent workflows**.
+
+- Inspired by **Pregel** and **Apache Beam**; its public interface draws from **NetworkX**.
+- Built by **LangChain Inc** (creators of LangChain), but **can be used without LangChain**.
+- Powers **production-grade agents**, trusted by LinkedIn, Uber, Klarna, GitLab, and many more.
+- Provides **fine-grained control over both the flow and state** of your agent applications via a central **persistence layer**.
+
+### Key features enabled by persistence
+
+- **Memory** — persists arbitrary aspects of application state, supporting memory of conversations and other updates within and across user interactions.
+- **Human-in-the-loop** — because state is **checkpointed**, execution can be **interrupted and resumed**, allowing decisions, validation, and corrections at key stages via human input.
+
+## The LangChain Ecosystem
+
+| Layer | What it holds | License |
+|-------|---------------|---------|
+| **Deployment** | LangGraph Platform | Commercial |
+| **Components** | Integrations, Vector Databases, Tools | OSS |
+| **Architecture** | LangChain + LangGraph | OSS |
+| **LangSmith** (credits) | Debugging, Playground, Prompt Management, Annotation, Testing, Monitoring | Commercial |
+
+## AI Agents / Agentic AI
+
+An **agentic** system is more than a single LLM call:
+
+```
+Input ──▶ LLM ──▶ Output
+             │
+             └──▶ 3rd-party APIs / Tools  (can loop back)
+```
+
+Instead of answering in one shot, the LLM can call **tools** and **3rd-party APIs**, then continue reasoning.
+
+## LangGraph Internals
+
+**LangGraph = Lang + Graph.** It models a workflow as a **DAG (Directed Acyclic Graph)** of **stateful AI agents** that control the **flow of information**.
+
+### Two core components
+
+1. **Nodes** — units of work (e.g. an LLM call, `llm(input)`).
+2. **Edges** — connections that decide what runs next.
+
+Every graph runs **START → nodes → END**.
+
+### Simple / Sequential workflow
+
+```
+START ──▶ Chatbot (calls LLM) ──▶ END
+```
+
+### Complex / Conditional workflow
+
+```
+        START
+          │
+          ▼
+       Chatbot ──(edges)──┐
+        │                 │
+        ▼                 ▼
+     Weather          Temperature
+        │                 │
+        ▼                 ▼
+       END               END
+```
+
+The **Chatbot** node branches via **conditional edges** to a **Weather** or **Temperature** node — each ending at **END**.
+
+## In One Line
+
+LangGraph is a **graph-based framework** where you wire LLM-powered **nodes** together with **edges** to build **stateful, controllable, multi-agent AI workflows** — from a single chatbot to branching, tool-using agents.
+
+---
+
+# 2. What Actually Is the State Schema?
+
+## The plain-English version
+
+The **state** is just **one dictionary that travels through your graph** — the single shared "notepad" every node reads from and writes to.
+
+The **state schema** is just you **declaring, up front, what fields that dictionary is allowed to have and what type each one is.** It's a *blueprint*, not a container — it describes the shape of the data that will flow, it doesn't hold the data itself.
+
+## Why it needs declaring
+
+In LangGraph, nodes **don't call each other** — they can't hand data to the next node directly. Instead there's one shared object:
+
+- a node **reads** what it needs from the state,
+- **returns a small update**,
+- LangGraph **merges** that update in and passes the state to the next node.
+
+For that hand-off to work, LangGraph must know what the state looks like. That declaration *is* the schema.
+
+## The diagram
+
+```
+                 STATE SCHEMA  (the blueprint / form)
+             ┌──────────────────────────────────────┐
+             │  class State(TypedDict):             │
+             │      name: str                        │
+             │      game: Literal["cricket", ...]    │
+             └──────────────────────────────────────┘
+                              │ StateGraph(State)
+                              ▼
+      the shared "notepad" (one dict per run) flows through:
+
+   START
+     │   state = {"name": "Krish"}
+     ▼
+ ┌───────────┐   reads state['name']
+ │ playgame  │   returns {"name": "... want to play"}   ── update ──┐
+ └───────────┘                                                       │
+     │   state = {"name": "Krish want to play"}   ◄── merged in ─────┘
+     ▼
+ ┌───────────┐   reads state['name']
+ │  cricket  │   returns {"name": "... cricket", "game": "cricket"}
+ └───────────┘
+     │   state = {"name": "Krish want to play cricket", "game": "cricket"}
+     ▼
+   END  ──►  final state returned to caller
+```
+
+**Mental model:** `state` = the shared memory of one graph run; `schema` = the form/template that memory must fill in. Nodes never pass data directly — they all read and write the *same* notepad.
+
+## The part that trips people up
+
+The **schema is only the shape definition.** Four separate things sit on top of it — and Notebooks 1–4 were really about these differences:
+
+| Thing | What it controls | In the notebooks |
+|-------|------------------|------------------|
+| **How you define it** | Syntax of the blueprint | `TypedDict` / `@dataclass` / Pydantic `BaseModel` |
+| **How you read it** | Dict vs attribute access | `state['name']` vs `state.name` |
+| **Whether types are enforced** | Is bad input rejected? | TypedDict & dataclass = **no**; Pydantic = **yes** (runtime `ValidationError`) |
+| **How updates merge** | Overwrite vs accumulate | default = **overwrite**; a **reducer** (`add_messages`) = **append** |
+
+## One sentence
+
+The **state schema is your declaration of what the shared data dictionary flowing through the graph looks like** — its field names and types — and every node is guaranteed to receive that dictionary, read from it, and return updates to it.
+
+---
+
+# 3. Reducers — How State Updates Merge
+
+## The plain-English version
+
+A **reducer** is a **merge rule for one state field**. It tells LangGraph *how* to combine the field's **old value** with the **update a node returns** — instead of just replacing it.
+
+```
+new_value = reducer(old_value, node_returned_value)
+```
+
+This is the fourth row of the state-schema table: *how updates merge* — overwrite vs accumulate.
+
+## The problem it solves
+
+Nodes never call each other. Each node just **returns a small dict** of the keys it wants to update, and LangGraph merges that into the shared state. By **default that merge is an overwrite** — the new value clobbers the old one.
+
+For a field like `messages` (a growing conversation), overwrite is a disaster:
+
+```
+Start:      messages = [A]
+Node 1 returns {"messages": [B]}  →  messages = [B]        ✗ lost A
+Node 2 returns {"messages": [C]}  →  messages = [C]        ✗ lost A and B
+```
+
+Every turn wipes the history. You wanted it to **accumulate**.
+
+## The two behaviours
+
+| | Rule | Result |
+|---|------|--------|
+| **No reducer (default)** | `reducer(old, new) → new` | overwrite — old value thrown away |
+| **`add_messages` reducer** | `reducer(old, new) → old + new` | append — history grows |
+
+Same idea as Python's `functools.reduce` or a Redux reducer: a function that folds a new update into existing state.
+
+## How you declare it — `Annotated`
+
+You attach the reducer to a field with `Annotated`. The reducer rides along as the field's metadata:
+
+```python
+from typing import Annotated
+from langgraph.graph.message import add_messages
+
+class State(TypedDict):
+    messages: Annotated[list, add_messages]
+    #                    ↑type  ↑reducer (the merge rule)
+```
+
+`Annotated[list, add_messages]` reads as: *messages is a list, and whenever a node updates it, merge with `add_messages` instead of overwriting.* Now the same run accumulates:
+
+```
+Start:      messages = [A]
+Node 1 returns {"messages": [B]}  →  messages = [A, B]      ✓
+Node 2 returns {"messages": [C]}  →  messages = [A, B, C]   ✓
+```
+
+Any field **without** an `Annotated[..., reducer]` keeps the default overwrite behaviour — reducers are per-field.
+
+## Why `add_messages` and not just `+`
+
+`add_messages` is smarter than a plain list append. It also:
+
+- **Assigns an ID** to any message that doesn't have one.
+- **Updates in place** instead of duplicating when the incoming message shares an ID with an existing one — useful for streaming and editing a message mid-run.
+
+That's why LangGraph ships it as a prebuilt reducer rather than making you write `lambda old, new: old + new`.
+
+## One sentence
+
+A **reducer is the per-field merge rule**: without one a node's update **overwrites** the field, and annotating a field like `messages` with `add_messages` switches the rule to **append**, so conversation history grows across nodes instead of being replaced.
+
+---
+
+# 4. LangGraph Basics — Notebook Walkthroughs
+
+Notes on the notebooks in `1-LangGraphBasics/`.
+
+## Notebook 1 — `1-simplelangchain.ipynb`: a graph with conditional branching
+
+A toy **"which sport to play"** graph that teaches the core LangGraph mechanics.
+
+- **State schema** — `State(TypedDict)` with one key `graph_info: str`. This is the shared data passed between nodes.
+- **Nodes are just functions** — `start_play`, `cricket`, `badminton`. Each takes `state`, appends text to `graph_info`, and returns the updated value. By default the returned value **overwrites** the state key.
+- **Conditional edge** — `random_play(state)` returns `"cricket"` or `"badminton"` based on `random.random() > 0.5`. Its return value is the **name of the next node** to route to.
+- **Graph wiring:**
+
+  ```
+  START → start_play → (random_play decides) → cricket   → END
+                                             ↘ badminton → END
+  ```
+
+  Built with `StateGraph(State)`, `add_node`, `add_edge`, `add_conditional_edges`, then `.compile()`.
+- **Invocation** — `.invoke({"graph_info": "Hey My name is Krish"})` runs START → node → END, and the text accumulates along the path taken, e.g. `"Hey My name is Krish I am planning to play Cricket"`.
+
+**Takeaway:** how to define state, add nodes, and use a **conditional edge** to branch the flow.
+
+### Key snippet
+
+```python
+from typing_extensions import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict):
+    graph_info: str
+
+def start_play(state: State):
+    return {"graph_info": state['graph_info'] + " I am planning to play"}
+
+def random_play(state: State) -> Literal['cricket', 'badminton']:
+    return "cricket" if random.random() > 0.5 else "badminton"
+
+graph = StateGraph(State)
+graph.add_node("start_play", start_play)
+graph.add_node("cricket", cricket)
+graph.add_node("badminton", badminton)
+graph.add_edge(START, "start_play")
+graph.add_conditional_edges("start_play", random_play)
+graph.add_edge("cricket", END)
+graph.add_edge("badminton", END)
+graph_builder = graph.compile()
+```
+
+## Notebook 2 — `2-chatbot.ipynb`: a minimal LLM chatbot graph
+
+The simplest possible chatbot — teaches **reducers + real LLM nodes**.
+
+- **State with a reducer** — `messages: Annotated[list, add_messages]`. Unlike notebook 1 (overwrite), `add_messages` **appends** each new message to the list instead of replacing it, so conversation history accumulates.
+- **The LLM** — `ChatGroq(model="openai/gpt-oss-120b")`, with `GROQ_API_KEY` loaded from `.env`.
+- **One node** — `superbot(state)` calls `llm.invoke(state['messages'])` and returns `{"messages": [response]}`; the reducer merges that `AIMessage` into the history.
+- **Graph wiring:**
+
+  ```
+  START → SuperBot → END
+  ```
+
+- **Invocation** — `.invoke({'messages': "Hi, My name is Chirag..."})` returns the state containing both the `HumanMessage` and the LLM's `AIMessage`.
+
+**Takeaway:** the same graph pattern, but now with (a) a **reducer** to accumulate messages and (b) a **node that calls an actual LLM** — the foundation of every LangGraph chatbot.
+
+### Key snippet
+
+```python
+from typing import Annotated
+from typing_extensions import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langchain_groq import ChatGroq
+
+class State(TypedDict):
+    messages: Annotated[list, add_messages]
+
+llm = ChatGroq(model="openai/gpt-oss-120b")
+
+def superbot(state: State):
+    return {"messages": [llm.invoke(state['messages'])]}
+
+graph = StateGraph(State)
+graph.add_node("SuperBot", superbot)
+graph.add_edge(START, "SuperBot")
+graph.add_edge("SuperBot", END)
+graph_builder = graph.compile()
+```
+
+## Notebook 3 — `3-DatclassStateScheme.ipynb`: different ways to define the state schema
+
+**Point of the notebook:** the state schema doesn't have to be a `TypedDict` — LangGraph accepts other Python types too. It builds the **same sport graph two ways** to compare how you define and access state.
+
+### Part A — TypedDict (recap)
+
+- State = `TypedDictState` with `name: str` and `game: Literal["cricket", "badminton"]`.
+- Nodes read state with **dictionary syntax**: `state['name']`.
+- Same flow as Notebook 1: `START → playgame → (decide_play 50/50) → cricket / badminton → END`.
+- Important note: TypedDict types are just **hints** — checked by tools like mypy / the IDE, **not enforced at runtime**. That's why `graph.invoke({"name": "123"})` runs fine even though `"123"` isn't a real name.
+
+### Part B — Dataclass
+
+- Same graph, but state = a `@dataclass` (`DataClassState`) instead of a dict.
+- Only real difference: nodes access fields with **attribute syntax** → `state.name` instead of `state['name']`.
+- Everything else (nodes, conditional edge, wiring, invoke) is identical.
+
+### Key snippet
+
+```python
+from typing_extensions import TypedDict
+from typing import Literal
+from dataclasses import dataclass
+
+# Option A: dict-style access -> state['name']
+class TypedDictState(TypedDict):
+    name: str
+    game: Literal["cricket", "badminton"]
+
+# Option B: attribute-style access -> state.name
+@dataclass
+class DataClassState:
+    name: str
+    game: Literal["badminton", "cricket"]
+```
+
+**Takeaway:** LangGraph is **flexible about how you define the state schema**. `TypedDict` (accessed like a dict, `state['name']`) and `@dataclass` (accessed like an object, `state.name`) are interchangeable for the same graph. (A later step usually adds **Pydantic**, which — unlike these two — *does* enforce types at runtime.)
+
+## Chains with LangGraph — the 4 building blocks
+
+(From the "Chains with LangGraph" notes — the roadmap for turning the basic graph into a tool-using agent.)
+
+The base shape is the familiar chain: `START → Node 1 → Node 2 → … → Node n → END`, using **nodes**, **normal edges**, and **conditional edges** (a conditional edge can loop back). On top of this skeleton, four new ideas are added:
+
+1. **Chat Messages** — the graph state now holds **chat messages** instead of plain strings: `HumanMessage` = input, `AIMessage` (from the LLM) = output. The state carries a conversation.
+2. **Chat Models** — use actual **LLM chat models inside a graph node** (the node calls the model to do its work).
+3. **Binding Tools** — give the LLM **tools** so it can reach **external sources** — 3rd-party APIs, a vector database, etc. (e.g. fetching *recent AI news*). Input → LLM decides to use a tool → output. This is "**bind tools to our chat model.**"
+4. **Execute Tool Calls** — actually **run the tool calls** the LLM requests, from within the graph nodes: the LLM says "call this tool," the node executes it and feeds the result back.
+
+**Takeaway:** this upgrades the basic graph into a **chain that passes chat messages through LLM nodes, binds tools to the model for external data, and executes the tool calls the LLM makes** — the foundation of a tool-using agent.
+
+## In one line
+
+Notebook 1 = graph structure + **conditional routing** (overwrite state); Notebook 2 = same skeleton but with a **reducer** (`add_messages`) and a **real LLM node** = a working chatbot; Notebook 3 = the same graph showing the state schema defined as a **TypedDict vs a dataclass** (dict access vs attribute access). **Chains** = adding chat messages, chat-model nodes, tool binding, and tool-call execution to build a tool-using agent.
+
+---
+
+# 5. Memory Across Conversations & How Tool Calls Really Work
+
+Two common points of confusion, cleared up.
+
+## 1. Does the graph "remember" previous conversations?
+
+**Within one conversation/run: yes. Across separate conversations: not automatically — you need persistence.**
+
+- The `add_messages` reducer accumulates messages **inside a single thread/run**. As long as the growing `messages` list is passed along, the model sees the whole history — that's memory *within* the conversation.
+- But two separate `graph.invoke(...)` calls are independent — the second starts **fresh**. In-memory state is gone once a run ends.
+- To remember **across** runs (or app restarts), add a **checkpointer** + a **`thread_id`**:
+
+```python
+from langgraph.checkpoint.memory import MemorySaver   # or SqliteSaver / Postgres for real persistence
+
+graph = builder.compile(checkpointer=MemorySaver())
+
+config = {"configurable": {"thread_id": "user-123"}}
+graph.invoke({"messages": [...]}, config)   # later calls with the same thread_id resume the same history
+```
+
+**Rule of thumb:**
+- `add_messages` → accumulate history **within** a run.
+- checkpointer + `thread_id` → remember **across** runs.
+
+This is the "Memory" + persistence-layer feature from the getting-started notes.
+
+## 2. Can the LLM put chunks directly into a vector DB by calling tools?
+
+**Mostly yes — but the LLM never touches the database itself. It only *requests* the tool; your code runs it.**
+
+```
+LLM does NOT write to the DB.
+LLM outputs a tool call  →  your graph node executes the tool  →  the tool writes to the vector DB
+```
+
+- The LLM's output is just a **structured request**, e.g. *"call `store_document(text=...)`."*
+- The tool's actual Python code (embed the text → insert into Pinecone / FAISS / etc.) does the work.
+- The LLM decides *whether* and *with what arguments*; it has **no direct DB access**.
+
+This is exactly the two Chains concepts:
+- **Binding Tools** = giving the model the capability.
+- **Execute Tool Calls** = your node actually running the requested tool.
+
+### Practical note
+
+You *can* wire it this way, but **bulk ingestion of chunks into a vector DB is usually a plain data pipeline, not an LLM job.** Loading + chunking + embedding thousands of documents is deterministic bulk work — you don't want to pay an LLM to decide each insert. Letting the LLM call a write-tool makes sense for **selective memory** ("remember this fact"), not bulk ingestion.
+
+| Direction | Common? | Who does it |
+|-----------|---------|-------------|
+| **Read** from vector DB via tool (retrieval / RAG) | Very common | LLM calls a `search` tool; tool queries the DB |
+| **Write** to vector DB via tool | Possible, selective | LLM requests it; the **tool** writes — usually for saving specific memories, not bulk ingest |
+
+## One sentence
+
+Message history only persists across separate conversations if you add a **checkpointer + thread_id**; and an LLM never touches a vector DB directly — it **emits a tool call** and your **graph node executes the tool** that does the reading or writing.
