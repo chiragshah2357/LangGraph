@@ -14,6 +14,8 @@ A single reference merged from the topic notes. Flow: **what it is → the state
 8. [Chatbot with Multiple Tools](#8-chatbot-with-multiple-tools)
 9. [Agents — the ReAct Architecture](#9-agents--the-react-architecture)
 10. [Practical Gotchas — Fixes from Building the Multi-Tool Chatbot](#10-practical-gotchas--fixes-from-building-the-multi-tool-chatbot)
+11. [Types of RAG — Agentic & Adaptive RAG](#11-types-of-rag--agentic--adaptive-rag)
+12. [Autonomous RAG — the Self-Managing RAG System](#12-autonomous-rag--the-self-managing-rag-system)
 
 ---
 
@@ -710,3 +712,169 @@ Jupyter caches imported modules and variables. After a `uv add`/downgrade, or af
 ## One sentence
 
 Most "it doesn't work" moments here are **version/environment traps** — docstring-less tools, node-name typos, stale kernels, and langchain-community's aging arxiv/wikipedia wrappers — fixed by adding docstrings, keeping names consistent, wrapping modern clients yourself, setting a real User-Agent, and restarting the kernel.
+
+---
+
+# 11. Types of RAG — Agentic & Adaptive RAG
+
+Two advanced RAG patterns, both built as **LangGraph state machines** (nodes + conditional edges that can loop). They're the natural payoff of everything above: an agent that decides *how* to retrieve.
+
+## Baseline: Traditional RAG (a fixed pipeline)
+
+```
+Question ──▶ retrieve from DB ──▶ stuff docs into LLM ──▶ Answer
+```
+
+It **always** retrieves, from **one** source, the **same** way — no matter the question. No decisions, no recovery if the docs are irrelevant.
+
+## 11a. Agentic RAG — let the agent decide how/whether to retrieve
+
+**Agentic RAG puts an LLM agent in charge of retrieval.** You give the LLM a **retriever tool** and it makes the decisions:
+
+- **Whether to retrieve at all** (a simple question may not need it).
+- **Which source** to query (company policy DB, legal docs DB, …).
+- **Whether the retrieved docs are relevant** — a **"check relevance" conditional edge** grades them.
+- **Rewrite the query and retry** if they're not relevant.
+- **Fail gracefully** — say *"I don't know"* instead of hallucinating.
+
+Graph shape (LangGraph):
+
+```
+        ┌───────── rewrite ◀──┐ (docs not relevant)
+        ▼                     │
+START ─▶ agent ──(should retrieve?)──▶ retrieve (tool) ──(check relevance)──┐
+          │  no                                                             │ yes
+          ▼                                                                 ▼
+         END                                                            generate ──▶ Answer
+```
+
+> "To implement a retrieval agent, we simply need to give an LLM access to a **retriever tool**." The agent node decides to call a `function_call` (retrieve) or end; the conditional edge after retrieval routes to **generate** (relevant) or **rewrite** (not).
+
+**Traditional vs Agentic:** traditional RAG's retrieval is hardwired; agentic RAG's retrieval is a *decision the LLM makes at runtime* — including which of several DBs to hit, and whether to give up.
+
+## 11b. Adaptive RAG — route by complexity, then self-correct
+
+**Adaptive RAG dynamically adjusts its strategy based on the query's complexity** — dig deep for hard questions, answer simple ones directly. It unites **two** ideas:
+
+**(1) Query analysis (routing).** A classifier inspects the question and picks a route:
+- *related to the index* → **retrieve** from the vector store
+- *unrelated to the index* → **web search**
+- *simple / factual* → answer directly (no retrieval)
+
+This is the jump from **single-step** (always one retrieve) and **multi-step** (always many) to **adaptive** (as many steps as the query actually needs).
+
+**(2) Active / self-corrective RAG (a.k.a. self-reflective RAG).** After retrieving, the graph *grades its own work* in a loop:
+- **Grade documents** — relevant? If not → **rewrite the question** and retrieve again.
+- **Generate**, then **check for hallucinations** — is the answer grounded in the docs? If not → regenerate.
+- **Check answer relevance** — does it actually address the question? If not → rewrite/retry.
+
+```
+Question ─▶ Query Analysis ─┬─(related)────▶ Retrieve ─▶ Grade ─(relevant?)─┬─yes─▶ Generate ─(grounded? answers Q?)─▶ Answer
+                            │                              ▲                 └─no──▶ Re-write question ─┘
+                            ├─(unrelated)─▶ Web search ─▶ Generate ─▶ Answer
+                            └─(simple)────▶ Answer directly
+```
+
+Because it grades, rewrites, and re-checks, it's a **RAG state machine** (loops via conditional edges), not a linear **RAG chain**. **CRAG (Corrective RAG)** and **Self-RAG** are the named self-reflection variants.
+
+## One sentence
+
+**Agentic RAG** makes retrieval a decision the LLM controls (retrieve? where? relevant? rewrite? give up?); **Adaptive RAG** routes each query by complexity and then self-corrects — grading docs, checking for hallucinations, and retrying — so both replace the fixed RAG pipeline with a looping LangGraph state machine.
+
+---
+
+# 12. Autonomous RAG — the Self-Managing RAG System
+
+These notes build a ladder from a plain retrieval graph up to a fully autonomous system. Each rung adds one capability.
+
+## 12a. The ladder
+
+**1) Basic Agentic RAG.** A linear graph: `__start__ → retriever → responder → __end__`.
+- Document → **embedding** → **vectorstore**; a query hits the **retriever**, which pulls **context** from the store.
+- **Responder** = `LLM + context` → output. This is ordinary RAG expressed as a graph.
+
+**2) Agentic RAG with ReAct.** The LLM becomes the **brain**, *bound* to tools and looping via ReAct.
+- `__start__ → react_agent → __end__`, where `react_agent` is `LLM` with **Tool 1 = Retriever**, **Tool 2 = Wikipedia**, **Tool 3 = Web Search** bound to it.
+- Adds a **self-reflection** loop: `Retriever + LLM → (self-reflection) → LLM judges: Yes → output / No → loop back`.
+
+**3) Query Planning & Decomposition vs Chain-of-Thought.** Two ways to handle a hard question:
+
+| Aspect | Chain-of-Thought (CoT) | Query Planning & Decomposition |
+|--------|------------------------|--------------------------------|
+| Purpose | Let the LLM reason step-by-step | Break a complex query into structured sub-queries |
+| Style | Natural-language reasoning path | Explicit sub-queries / formal question segments |
+| Inspiration | Human-like scratchpad thinking | Structured task planning / modular Q&A |
+| Agent behavior | Think → Retrieve → Think → Answer | Plan all → Retrieve all → Answer once |
+
+Query-planning flow: `PLAN query → SQ1/SQ2/SQ3 → retrieve each → combine context → output`.
+
+**4) Iterative Retrieval.** A grading loop instead of a single shot:
+```
+Retrieve → Generate → Reflect → Refine ──(not good enough)──▶ back to Retrieve
+                                        └─(good)─────────────▶ END
+```
+
+**5) Answer Synthesis from multiple sources.** One query fans out across sources and the LLM **synthesizes** one answer: `LLM → {Retriever, Wikipedia, ArXiv, YouTube} → synthesize → output`.
+
+**6) Autonomous RAG.** The top of the ladder — it *combines all of the above*.
+
+## 12b. What is Autonomous RAG?
+
+**Autonomous RAG is a Retrieval-Augmented Generation system where the LLM (or agent) can reason, plan, act, reflect, and improve — on its own — without manual control over each step.**
+
+It combines:
+- **Agentic reasoning** (ReAct / LangGraph agents)
+- **Self-reflection & self-correction**
+- **Dynamic tool selection**
+- **Multi-source retrieval**
+
+Put differently, it stacks: **ReAct + CoT + Query Planning/Decompose + Retrieval strategies + Self-Reflection**.
+
+## 12c. Core components
+
+| Component | Role |
+|-----------|------|
+| **Planner Agent** | Breaks complex queries into sub-questions |
+| **Tool Selector** | Chooses between Wikipedia, ArXiv, vector DBs, APIs, etc. |
+| **Retriever** | Executes tool calls to retrieve relevant documents |
+| **Synthesizer** | Uses the LLM to generate the final answer |
+| **Reflector** | Verifies whether context or answer is good enough |
+| **Retry Loop** | Refines and retries if reflection fails |
+| **Memory** (optional) | Stores feedback, logs bad queries, improves prompts/tools |
+
+## 12d. Complete flow (workflow with LangGraph)
+
+```
+Query
+  ▼
+Query Planning & Decomposition        ①
+  ▼
+Chain of Thought                      ②
+  ▼
+ReAct:  Reason → Act → Observe        (Agentic RAG)
+  ▼
+Iterative Retrieval Check ◀─────────────────┐  (Multiple Sources)
+  ▼                                          │
+Answer Synthesis                             │
+  ▼                                          │
+Self-Reflection ─(No)────────────────────────┘
+  │
+  └─(Good)─▶ END
+```
+
+## 12e. Agentic RAG vs Autonomous RAG
+
+| Concept | Agentic RAG | Autonomous RAG |
+|---------|-------------|----------------|
+| **Definition** | A RAG system using an **agentic approach** — an LLM reasons, plans, and acts using tools | A RAG system that **operates independently**, with **full self-management** of planning, retrieving, reflection, and improvement |
+| **Focus** | Structured reasoning and tool use (ReAct, LangGraph) | Complete autonomy in task execution, retry, and learning |
+| **Behavior** | Think → Act → Observe → Answer | Think → Act → **Reflect → Retry → Learn** → Answer |
+| **Retry logic** | Optional — usually static agent plans | Built-in retry/refine strategies (context + answer reflection) |
+| **Self-reflection** | May include it optionally | **Core feature** — reflects on retrieval & answers before finalizing |
+| **Tool use** | Uses tools via agents (Wikipedia, SQL, ArXiv) | Selects and adapts tools **dynamically** based on reasoning |
+| **Planner** | Often present (manual or LLM-generated plans) | **Always present** — triggers multi-step workflows adaptively |
+| **Learning loop** | Not always present | May log feedback and improve over time |
+
+## One sentence
+
+**Autonomous RAG** is the fully self-managing end of the RAG ladder: it plans and decomposes the query, reasons (CoT + ReAct), retrieves from multiple sources, then **reflects, retries, and learns on its own** — where Agentic RAG stops at *Think → Act → Observe → Answer*, Autonomous RAG closes the loop with *Reflect → Retry → Learn*.
