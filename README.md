@@ -16,6 +16,7 @@ A single reference merged from the topic notes. Flow: **what it is → the state
 10. [Practical Gotchas — Fixes from Building the Multi-Tool Chatbot](#10-practical-gotchas--fixes-from-building-the-multi-tool-chatbot)
 11. [Types of RAG — Agentic & Adaptive RAG](#11-types-of-rag--agentic--adaptive-rag)
 12. [Autonomous RAG — the Self-Managing RAG System](#12-autonomous-rag--the-self-managing-rag-system)
+13. [Multi-Agent RAG — Networks & Hierarchical Teams](#13-multi-agent-rag--networks--hierarchical-teams)
 
 ---
 
@@ -878,3 +879,210 @@ Self-Reflection ─(No)───────────────────
 ## One sentence
 
 **Autonomous RAG** is the fully self-managing end of the RAG ladder: it plans and decomposes the query, reasons (CoT + ReAct), retrieves from multiple sources, then **reflects, retries, and learns on its own** — where Agentic RAG stops at *Think → Act → Observe → Answer*, Autonomous RAG closes the loop with *Reflect → Retry → Learn*.
+
+---
+
+# 13. Multi-Agent RAG — Networks & Hierarchical Teams
+
+Notes on `3-AgenticRAG/8-multiagent.ipynb`. Everything so far ran the whole RAG pipeline through **one** agent. A **Multi-Agent RAG system splits that pipeline across multiple specialized agents** — each owns a role (research, writing, charting) — and they collaborate on a single query. The notebook builds **two** patterns: a flat **agent network** (two peers hand off), then a **hierarchical team** system (supervisors of supervisors).
+
+## Why multi-agent?
+
+One agent with ten tools and a giant prompt gets confused — it picks the wrong tool, forgets the goal, and its context balloons. Splitting the work gives each agent a **narrow toolset + a focused prompt**, which is more reliable and easier to debug. The trade-off is orchestration: someone has to decide *who acts next* and *when the work is done*.
+
+```
+Single agent (overloaded)          Multi-agent (specialized)
+   ┌───────────────┐                 researcher ──▶ writer
+   │  1 LLM        │                     │            │
+   │  + 10 tools   │                     └── shared state ──┘
+   │  + huge prompt│                 each: few tools, one job
+   └───────────────┘
+```
+
+## Shared setup
+
+```python
+llm = init_chat_model("openai/gpt-oss-120b", max_tokens=1024, model_provider="groq")
+tavily_tool = TavilySearch(max_results=5)          # web search
+```
+
+One Groq LLM is reused by **every** agent; each agent differs only by its **tools** and **prompt**, not its model. `max_tokens=1024` caps each reply.
+
+A reusable factory turns any text file into a **retriever tool** (load → chunk → embed into FAISS → wrap as a `Tool`), so agents can search local notes:
+
+```python
+def make_retriever_tool_from_text(file, name, desc):
+    docs   = TextLoader(file, encoding="utf-8").load()
+    chunks = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50).split_documents(docs)
+    vs     = FAISS.from_documents(chunks, HuggingFaceEmbeddings())
+    retriever = vs.as_retriever()
+    def tool_func(query: str) -> str:
+        return "\n\n".join(doc.page_content for doc in retriever.invoke(query))
+    return Tool(name=name, description=desc, func=tool_func)
+
+internal_tool_1 = make_retriever_tool_from_text(
+    "sample_docs.txt", "InternalResearchNotes", "Search internal research notes ...")
+```
+
+## 13a. Pattern 1 — Agent Network (flat hand-off)
+
+**Two peer agents share one message list and pass control back and forth** until one prefixes `FINAL ANSWER`. There is no boss — each agent's node decides where to go next.
+
+### The three helpers
+
+```python
+def get_next_node(last_message, goto):
+    if "FINAL ANSWER" in last_message.content:   # anyone can end the run
+        return END
+    return goto
+
+def make_system_prompt(suffix):                  # shared collaboration rules + a role suffix
+    return ("You are a helpful AI assistant, collaborating with other assistants. "
+            "... If you or any other assistant has the final answer, prefix your "
+            "response with FINAL ANSWER so the team knows to stop.\n" + suffix)
+```
+
+- **`get_next_node`** is the stop condition — the string `FINAL ANSWER` anywhere in the last message ends the graph.
+- **`make_system_prompt`** bakes in the collaboration protocol (*make progress → hand off → signal completion*) and appends each agent's specialization.
+
+### The two agents and their nodes
+
+```python
+research_agent = create_react_agent(llm, tools=[internal_tool_1, tavily_tool],
+    prompt=make_system_prompt("You can only do research. ... working with a content writer colleague."))
+
+blog_agent = create_react_agent(llm, tools=[],   # writer has NO tools — it only writes prose
+    prompt=make_system_prompt("You can only write a detailed blog. ... working with a researcher colleague."))
+
+def research_node(state) -> Command[Literal["blog_generator", END]]:
+    result = research_agent.invoke(state)
+    goto   = get_next_node(result["messages"][-1], "blog_generator")
+    result["messages"][-1] = HumanMessage(content=result["messages"][-1].content, name="researcher")
+    return Command(update={"messages": result["messages"]}, goto=goto)
+```
+
+Two things worth noticing in every node:
+
+1. **Return a `Command`** — it *both* updates the shared state **and** names the next node (`goto`). The routing lives in the node, not in a static edge.
+2. **Re-wrap the last message as a `HumanMessage`** — some providers reject a trailing `AIMessage` when it's fed to the next agent, so the agent's output is relabelled (with a `name=` so you can tell who said it) before hand-off.
+
+`blog_node` mirrors this but routes back to `researcher`.
+
+### Wiring
+
+```python
+workflow = StateGraph(MessagesState)
+workflow.add_node("researcher", research_node)
+workflow.add_node("blog_generator", blog_node)
+workflow.add_edge(START, "researcher")           # only START is a static edge; the rest is Command-routed
+graph = workflow.compile()
+```
+
+```
+START ─▶ researcher ⇄ blog_generator
+              │              │
+              └──(FINAL ANSWER → END)─┘
+```
+
+> ⚠️ **The 413 trap.** Because both agents keep appending to — and re-sending — the *entire* growing message list, a big request (`"Write a detailed blog on transformer variants in production deployments"`) can exceed Groq's per-request token cap → `APIStatusError 413 – Request too large`. Fixes: `trim_messages(...)` before each call, a smaller `max_tokens`, summarizing instead of forwarding raw history, or a higher-tier model.
+
+## 13b. Pattern 2 — Hierarchical Agent Teams (supervisors)
+
+When one worker's job gets too big, or there are too many workers, **distribute the work hierarchically**: a **supervisor** LLM routes between workers, and a **top-level supervisor** routes between whole *teams*. Subgraphs compose into a bigger graph.
+
+```
+                    top supervisor
+                    /            \
+         research_team          writing_team          ← each is a full subgraph
+         (supervisor)           (supervisor)
+        /     |     \          /     |      \
+   search  web_    …      doc_    note_   chart_
+          scraper        writer   taker   generator
+```
+
+### The supervisor factory
+
+The heart of the pattern — an LLM that **picks the next worker via structured output** (so the choice is a valid enum, not free text):
+
+```python
+class State(MessagesState):
+    next: str                                    # records who acts next
+
+def make_supervisor_node(llm, members):
+    options = ["FINISH"] + members
+    system_prompt = (f"You are a supervisor managing these workers: {members}. "
+                     "Respond with the worker to act next. When finished, respond with FINISH.")
+    class Router(TypedDict):
+        next: Literal[*options]                  # forces the LLM to choose a valid option
+    def supervisor_node(state) -> Command[Literal[*members, "__end__"]]:
+        messages = [{"role": "system", "content": system_prompt}] + state["messages"]
+        goto = llm.with_structured_output(Router).invoke(messages)["next"]
+        if goto == "FINISH":
+            goto = END
+        return Command(goto=goto, update={"next": goto})
+    return supervisor_node
+```
+
+`with_structured_output(Router)` is what makes routing **reliable** — the model must return one of the allowed worker names or `FINISH`.
+
+### Workers always report back
+
+Unlike Pattern 1 (peers route to each other), every worker in a team routes **back to its supervisor** — the supervisor is the only one that decides what's next:
+
+```python
+search_agent = create_react_agent(llm, tools=[tavily_tool, internal_tool_1])
+def search_node(state) -> Command[Literal["supervisor"]]:
+    result = search_agent.invoke(state)
+    return Command(
+        update={"messages": [HumanMessage(content=result["messages"][-1].content, name="search")]},
+        goto="supervisor")                       # ALWAYS report back
+```
+
+The **research team** (`search`, `web_scraper`) and the **writing team** (`doc_writer`, `note_taker`, `chart_generator` — with file tools `create_outline` / `write_document` / `edit_document` / `read_document` and a `python_repl_tool`) are each compiled into their own subgraph:
+
+```python
+research_builder = StateGraph(State)
+research_builder.add_node("supervisor", make_supervisor_node(llm, ["search", "web_scraper"]))
+research_builder.add_node("search", search_node)
+research_builder.add_node("web_scraper", web_scraper_node)
+research_builder.add_edge(START, "supervisor")
+research_graph = research_builder.compile()       # a self-contained unit
+```
+
+### Teams as nodes in a top graph
+
+Each **subgraph becomes a single node** in the top-level graph. The top supervisor routes research-vs-writing; each team reports back up:
+
+```python
+def call_research_team(state) -> Command[Literal["supervisor"]]:
+    response = research_graph.invoke({"messages": state["messages"][-1]})   # run the whole subgraph
+    return Command(
+        update={"messages": [HumanMessage(content=response["messages"][-1].content, name="research_team")]},
+        goto="supervisor")
+
+super_builder = StateGraph(State)
+super_builder.add_node("supervisor", make_supervisor_node(llm, ["research_team", "writing_team"]))
+super_builder.add_node("research_team", call_research_team)
+super_builder.add_node("writing_team", call_paper_writing_team)
+super_builder.add_edge(START, "supervisor")
+super_graph = super_builder.compile()
+
+super_graph.invoke({"messages": [("user", "Write about transformer variants in production deployments in short.")]})
+```
+
+Note the `"in short"` — deliberately small to dodge the same token blow-up as Pattern 1.
+
+## Network vs Hierarchical — the contrast
+
+| | **Agent Network (13a)** | **Hierarchical Teams (13b)** |
+|---|---|---|
+| **Who routes** | each agent (peer-to-peer, via `Command.goto`) | a **supervisor** LLM (structured-output router) |
+| **Stop signal** | `"FINAL ANSWER"` string in a message | supervisor returns `FINISH` |
+| **Shape** | flat, 2 peers ping-pong | tree: top supervisor → team supervisors → workers |
+| **Scales to** | a few collaborators | many workers, grouped into teams |
+| **State** | `MessagesState` | `MessagesState + next` |
+| **Composition** | one graph | subgraphs nested as nodes |
+
+## One sentence
+
+**Multi-agent RAG splits the pipeline across specialized agents sharing one message state**: a *network* lets peers hand off directly and stop on `FINAL ANSWER`, while *hierarchical teams* add supervisor LLMs that route between workers (and a top supervisor that routes between whole teams via structured output) — the price of both being careful message management, since blindly forwarding the whole growing history is what triggers the `413 Request too large` error.
