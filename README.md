@@ -17,6 +17,7 @@ A single reference merged from the topic notes. Flow: **what it is → the state
 11. [Types of RAG — Agentic & Adaptive RAG](#11-types-of-rag--agentic--adaptive-rag)
 12. [Autonomous RAG — the Self-Managing RAG System](#12-autonomous-rag--the-self-managing-rag-system)
 13. [Multi-Agent RAG — Networks & Hierarchical Teams](#13-multi-agent-rag--networks--hierarchical-teams)
+14. [Corrective RAG (CRAG) — Grade & Self-Correct Retrieval](#14-corrective-rag-crag--grade--self-correct-retrieval)
 
 ---
 
@@ -1086,3 +1087,79 @@ Note the `"in short"` — deliberately small to dodge the same token blow-up as 
 ## One sentence
 
 **Multi-agent RAG splits the pipeline across specialized agents sharing one message state**: a *network* lets peers hand off directly and stop on `FINAL ANSWER`, while *hierarchical teams* add supervisor LLMs that route between workers (and a top supervisor that routes between whole teams via structured output) — the price of both being careful message management, since blindly forwarding the whole growing history is what triggers the `413 Request too large` error.
+
+---
+
+# 14. Corrective RAG (CRAG) — Grade & Self-Correct Retrieval
+
+Notes based on `notes/37.1-Corrective-RAGs.pdf`. CRAG is one of the named self-reflection variants mentioned back in [§11 (Adaptive RAG)](#11b-adaptive-rag--route-by-complexity-then-self-correct) — here it gets its own treatment.
+
+## The one-line idea
+
+**Corrective RAG (CRAG) is RAG with a quality-control step.** It improves the accuracy and relevance of answers by adding **self-reflection and self-grading of the retrieved documents** — it evaluates what was retrieved and applies **corrective actions** (refine or replace bad retrievals) *before* generating.
+
+## Why basic RAG needs it
+
+Traditional RAG relies **heavily on the accuracy of the retrieved documents**. If the retrieved information is flawed or incomplete, the generated answer is flawed too — the pipeline has no way to notice or recover:
+
+```
+Question ──▶ retrieve ──▶ stuff docs into LLM ──▶ Answer   (trusts the docs blindly)
+```
+
+## The CRAG flow
+
+CRAG inserts a **grader** after retrieval and branches on it:
+
+```
+                                   ┌── No (all relevant) ─────────────────────────▶ Generate ─▶ Answer
+Question ─▶ Retrieve ─▶ Grade ─(any doc irrelevant?)                                    ▲
+              (Vector DB)   (LLM)  └── Yes ─▶ Re-write query ─▶ Web Search ─────────────┘
+                                              └──── corrective action ────┘
+```
+
+- **Retrieve** pulls candidate docs from the vector DB.
+- **Grade** — an LLM **retrieval evaluator** scores each doc for relevance ("evaluating the retrieved documents").
+- **Decision:** *is any doc irrelevant?*
+  - **No** → the context is trusted → **generate** the answer directly.
+  - **Yes** → take **corrective action**: **re-write the query** and run a **web search** to pull better/fresh information, then generate.
+
+This grade → decide → correct loop is the **self-reflection / self-grading** mechanism — the system critiques its own retrieval instead of answering from bad context.
+
+## Core components
+
+| Component | Role |
+|-----------|------|
+| **Retrieval Evaluator** | Assesses the quality/relevance of the retrieved documents (the grader). |
+| **Generative Model** | Produces the answer from the (corrected) retrieved context. |
+| **Refinement & Correction** | Strategies — knowledge refinement, query rewrite, **web search** — that fix the issues the evaluator flags. |
+
+## The LangGraph shape
+
+Implemented as a state machine with a conditional edge out of the grader:
+
+```
+__start__ ─▶ retrieve ─▶ grade_documents ─┬─(relevant)──────────────────────▶ generate ─▶ __end__
+                                          └─(irrelevant)─▶ transform_query ─▶ web_search_node ─┘
+```
+
+- `retrieve` → `grade_documents` run every time.
+- `grade_documents` is the **conditional edge**: relevant docs go straight to `generate`; irrelevant ones detour through `transform_query` (rewrite) → `web_search_node` before `generate`.
+
+## Benefits
+
+1. **Improved accuracy** — evaluating and correcting retrieval keeps the final answer grounded in good context.
+2. **Enhanced relevance** — the grader filters out irrelevant docs so they don't pollute generation.
+3. **Increased robustness** — when the initial retrieval is imperfect, web-search correction recovers instead of failing.
+
+## CRAG vs plain RAG vs Self-RAG
+
+| | Plain RAG | **CRAG** | Self-RAG |
+|---|-----------|----------|----------|
+| Grades retrieved docs? | No | **Yes** (relevance) | Yes |
+| Corrective action | None | **Rewrite query + web search** | Retrieve-on-demand + critique tokens |
+| Checks the *generated* answer? | No | Not the core focus | Yes (grounding + usefulness) |
+| Shape | linear chain | **state machine (loops/branches)** | state machine |
+
+## One sentence
+
+**Corrective RAG (CRAG) adds a retrieval evaluator that grades the retrieved documents and, when any are irrelevant, takes corrective action — rewriting the query and pulling fresh context via web search before generating** — turning the blind linear RAG pipeline into a self-grading, self-correcting LangGraph state machine (`retrieve → grade_documents → [transform_query → web_search] → generate`).
